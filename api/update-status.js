@@ -1,54 +1,40 @@
-    // api/update-status.js
-require('dotenv').config({ path: '../../.env' }); // Load .env file
+// api/update-status.js
+require('dotenv').config({ path: '../../.env' });
 
 const { sendWhatsAppMessage } = require('../utils/sendWhatsApp');
-const { sendEmail } = require('../utils/sendEmail');
+const { sendEmail } = require('../utils/sendEmail'); // Use updated sender
 
-// This is the main function Vercel will run
 module.exports = async (req, res) => {
-  // Only allow POST requests
   if (req.method !== 'POST') {
     return res.status(405).send('Method Not Allowed');
   }
 
   try {
-    // Get the data sent from Google Apps Script
     const { status, name, phone, email } = req.body;
-
     console.log(`Received status update: ${status} for ${name}`);
 
-    // Use a switch to decide which message to send
+     // Prepare components for WhatsApp templates if they need variables
+     const customerNameComponent = [
+         { type: 'body', parameters: [{ type: 'text', text: name }] }
+     ];
+
     switch (status) {
       case 'Contacted':
-        // 1. Send "Contacted" WhatsApp
-        // Note: You must pre-define 'contacted_template' in Meta
-        // If your template has variables (e.g., customer name), you add 'components'
-        await sendWhatsAppMessage(phone, 'contacted_template_name');
-
-        // 2. Send "Contacted" Email
-        await sendEmail(
-          email,
-          'Following up on your enquiry - JANVI PACKAGING',
-          `<p>Hi ${name},</p><p>Thank you for your interest. We have received your enquiry and will be in touch shortly.</p>`
-        );
+        // Use 'contacted' template name and pass name variable
+        await sendWhatsAppMessage(phone, 'contacted', customerNameComponent);
+        // Use updated sendEmail with type 'contacted'
+        await sendEmail(email, name, 'contacted');
         break;
 
       case 'Order Confirmed':
-        // 1. Send "Order Confirmed" WhatsApp
-        await sendWhatsAppMessage(phone, 'order_confirmed_template_name');
-
-        // 2. Send "Order Confirmed" Email
-        await sendEmail(
-          email,
-          'Your Order is Confirmed! - JANVI PACKAGING',
-          `<p>Hi ${name},</p><p>We are happy to inform you that your order has been confirmed.</p>`
-        );
+         // Use 'order_confirmed' template name and pass name variable
+        await sendWhatsAppMessage(phone, 'order_confirmed', customerNameComponent);
+         // Use updated sendEmail with type 'order_confirmed'
+        await sendEmail(email, name, 'order_confirmed');
         break;
-      
-      // Add more cases here (e.g., 'Shipped', 'Cancelled')
+      // Add more cases if needed
     }
 
-    // Send a success response back to Google Apps Script
     res.status(200).send({ message: 'Automation triggered successfully' });
 
   } catch (error) {

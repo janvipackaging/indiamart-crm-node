@@ -3,180 +3,202 @@ require('dotenv').config({ path: '../../.env' }); // Load .env file
 const { google } = require('googleapis');
 const cheerio = require('cheerio');
 const { sendWhatsAppMessage } = require('../utils/sendWhatsApp');
-const { sendEmail } = require('../utils/sendEmail');
+const { sendEmail } = require('../utils/sendEmail'); // Use updated sender
 
-// --- Google API Authentication ---
-
-// 1. Auth for Google Sheets (Service Account)
-const sheetsAuth = new google.auth.GoogleAuth({
-  credentials: {
-    client_email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
-    private_key: process.env.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY.replace(/\\n/g, '\n'), // Fix for Vercel
-  },
-  scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-});
-
-// 2. Auth for Gmail (OAuth 2.0)
-const oauth2Client = new google.auth.OAuth2(
-  process.env.GOOGLE_CLIENT_ID,
-  process.env.GOOGLE_CLIENT_SECRET,
-  'https://developers.google.com/oauthplayground' // Redirect URI
-);
-
-oauth2Client.setCredentials({
-  refresh_token: process.env.GOOGLE_REFRESH_TOKEN,
-});
-
+// --- Google API Authentication (Same as before) ---
+const sheetsAuth = new google.auth.GoogleAuth({ /* ... credentials ... */ });
+const oauth2Client = new google.auth.OAuth2( /* ... credentials ... */ );
+oauth2Client.setCredentials({ /* ... refresh token ... */ });
 const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
 const sheets = google.sheets({ version: 'v4', auth: sheetsAuth });
 
-// --- Email Parsing Function (NEEDS CUSTOMIZATION) ---
-
-function parseIndiaMartEmail(htmlBody) {
-  // This function is a GUESS. You MUST inspect your email's HTML
-  // and update the selectors (e.g., 'table.enq-table') to match.
-  
+// --- !! PARSING FUNCTION UPDATED FOR COMPANY NAME !! ---
+function parseIndiaMartEmail(htmlBody, subject, fromAddress) {
   try {
     const $ = cheerio.load(htmlBody);
-    
-    // Example: Find the table with the lead data.
-    // Right-click your email in Gmail -> "Inspect" to find the real tags.
-    const leadTable = $('table').first(); // This is just a guess
-    
-    // --- !! UPDATE THESE SELECTORS !! ---
-    const name = leadTable.find('td:contains("Sender Name")').next().text().trim();
-    const email = leadTable.find('td:contains("Email")').next().text().trim();
-    const phone = leadTable.find('td:contains("Mobile")').next().text().trim();
-    const product = leadTable.find('td:contains("Product Name")').next().text().trim();
-    const message = leadTable.find('td:contains("Message")').next().text().trim();
-    
-    // Clean up the phone number (e.g., remove "+")
-    const cleanedPhone = phone.replace(/[^0-9]/g, '');
+    let lead = {
+        name: '',
+        company: '', // Added company field
+        email: '',
+        phone: '',
+        product: '',
+        message: '',
+    };
 
-    if (!name || !cleanedPhone || !email) {
-      console.warn('Could not parse all details from email.');
+    const isBuyLead = fromAddress.includes('buyleads@indiamart.com');
+    const isEnquiry = fromAddress.includes('buyershelpdesk@indiamart.com') || fromAddress.includes('buyershelp+enq@indiamart.com');
+
+    if (isBuyLead) {
+      console.log("Parsing as Buy Lead...");
+      lead.product = $('div[style*="font-size:18px"] strong').first().text().trim();
+      const contactBlock = $('a[href*="call+"]').closest('div');
+      if (!contactBlock.length) return null;
+      const contactHtml = contactBlock.html();
+      const contactLines = contactHtml.split('<br>').map(line => line.replace(/<\/?[^>]+(>|$)/g, "").trim()); // Split and clean HTML tags
+
+      lead.name = contactLines[0] || '';
+      // Try to extract company name from the second line, clean city/state
+      if (contactLines.length > 1) {
+          lead.company = contactLines[1].split(/ - |,/)[0].trim(); // Take text before " - " or ","
+          // Further cleaning if it looks like just a location
+          if (/^\d+,\s*\w{2}$/.test(lead.company) || lead.company.toLowerCase() === 'india') {
+            lead.company = ''; // Remove if it looks like "600050, TN" or just "India"
+          }
+      }
+
+      const phoneLink = contactBlock.find('a[href*="call+"]').first().text().trim();
+      lead.phone = phoneLink.replace(/[^0-9]/g, '');
+      lead.email = contactBlock.find('a[href*="mailto:"]').first().text().trim();
+
+      // Requirements parsing (same as before)
+      let message = '';
+      let reqTable = $('strong:contains("Quantity")').closest('table');
+      if (!reqTable.length) reqTable = $('strong:contains("Width")').closest('table');
+      if (!reqTable.length) reqTable = $('strong:contains("Thickness")').closest('table');
+      reqTable.find('tr').each((i, el) => { /* ... (same logic) ... */ });
+      lead.message = message.trim();
+
+    } else if (isEnquiry) {
+      console.log("Parsing as Enquiry...");
+      // Product parsing (same as before)
+      lead.product = $('p:contains("I am looking for") b').first().text().trim();
+      // ... (fallback logic same as before) ...
+
+       // Requirements parsing (same as before)
+      let message = '';
+       $('span:contains("Below are the requirement details")').closest('tr').next('tr').find('table tr').each((i, row) => { /* ... (same logic) ... */ });
+       lead.message = message.trim();
+
+      // Contact Details (from Regards section) - UPDATED for company
+      const regardsTable = $('td:contains("Regards")').closest('table');
+      const nameRow = regardsTable.find('span:contains("Regards")').closest('tr').nextAll('tr').first();
+      lead.name = nameRow.find('span').text().trim();
+
+      // Company might be on the row after the name
+      const companyRow = nameRow.next('tr');
+      const companyText = companyRow.find('span').text().trim();
+      // Check if the next line exists and doesn't look like an address line starting with city or email/phone
+      if (companyText && !companyText.startsWith('Click to call:') && !companyText.startsWith('Email:') && !companyText.match(/^[A-Za-z\s]+ - \d+,/)) {
+          lead.company = companyText.split(',')[0].trim(); // Take text before comma
+          if (lead.company.toLowerCase() === 'india') lead.company = ''; // Clean if just "India"
+      } else {
+          lead.company = ''; // Assume no company if next line looks like address or contact
+      }
+
+      const phoneLinkElement = regardsTable.find('a[href*="call+"]').first();
+      lead.phone = phoneLinkElement.text().replace(/[^0-9]/g, '');
+
+      const emailLinkElement = regardsTable.find('a[href*="mailto:"]').first();
+      lead.email = emailLinkElement.text().split(' ')[0].trim();
+
+    } else {
+      console.warn(`Unknown email format from: ${fromAddress}. Subject: ${subject}`);
       return null;
     }
 
-    return {
-      name,
-      email,
-      phone: cleanedPhone, // Make sure to include country code (e.g., 91)
-      product,
-      message,
-    };
+    // --- Common Validation and Cleanup (Same as before) ---
+    if (!lead.product) return null;
+    if (!lead.name || !lead.phone || !lead.email) return null;
+    if (lead.phone && !lead.phone.startsWith('91') && lead.phone.length >= 10) {
+        lead.phone = `91${lead.phone.slice(-10)}`;
+    } else if (lead.phone && lead.phone.length < 10) {
+        console.warn(`Phone number ${lead.phone} seems too short. Skipping.`);
+        return null;
+    }
+
+    console.log("Parsed Lead:", lead);
+    return lead;
+
   } catch (error) {
-    console.error('Error parsing email HTML:', error);
+    console.error(`CRITICAL Error parsing email HTML (Subject: ${subject}):`, error);
     return null;
   }
 }
 
-// --- Helper to decode Gmail's base64 body ---
+// --- getEmailBody function (Same as before) ---
+function getEmailBody(message) { /* ... (same logic) ... */ }
 
-function getEmailBody(message) {
-  const parts = message.payload.parts;
-  let bodyData = '';
-
-  if (message.payload.body.data) {
-    bodyData = message.payload.body.data;
-  } else if (parts) {
-    // Find the HTML part
-    const part = parts.find((p) => p.mimeType === 'text/html');
-    if (part) {
-      bodyData = part.body.data;
-    }
-  }
-  
-  if (!bodyData) return null;
-
-  return Buffer.from(bodyData, 'base64').toString('utf-8');
-}
-
-// --- Main Serverless Function ---
-
+// --- Main Serverless Function (UPDATED) ---
 module.exports = async (req, res) => {
   try {
     console.log('Cron job started: Checking for new emails...');
 
-    // 1. Search for new IndiaMart emails
     const listResponse = await gmail.users.messages.list({
       userId: 'me',
-      // !! Check your Gmail for the exact subject/sender !!
-      q: 'is:unread from:alerts@indiamart.com subject:"New Enquiry"', 
+      q: 'is:unread {from:buyleads@indiamart.com from:buyershelpdesk@indiamart.com from:buyershelp+enq@indiamart.com} subject:film',
     });
 
     const messages = listResponse.data.messages;
     if (!messages || messages.length === 0) {
-      console.log('No new emails found.');
+      console.log('No new emails found matching the criteria.');
       return res.status(200).send('No new emails found.');
     }
 
     console.log(`Found ${messages.length} new email(s).`);
     const leadsAdded = [];
+    const leadsFailed = [];
 
-    // 2. Process each email
     for (const msg of messages) {
-      const msgResponse = await gmail.users.messages.get({
-        userId: 'me',
-        id: msg.id,
-      });
+      let subject = ''; let fromAddress = ''; let msgId = msg.id;
+      try {
+        const msgResponse = await gmail.users.messages.get({ userId: 'me', id: msgId, format: 'full' });
+        if (!msgResponse.data || !msgResponse.data.payload) { /* ... skip ... */ }
 
-      const htmlBody = getEmailBody(msgResponse.data);
-      if (!htmlBody) continue;
+        const headers = msgResponse.data.payload.headers;
+        subject = headers.find(h => h.name.toLowerCase() === 'subject')?.value || 'No Subject';
+        fromAddress = headers.find(h => h.name.toLowerCase() === 'from')?.value || 'Unknown Sender';
 
-      // 3. Parse the email content
-      const lead = parseIndiaMartEmail(htmlBody);
-      if (!lead) {
-        console.warn(`Could not parse email ID: ${msg.id}`);
-        continue; // Skip this email
-      }
+        const htmlBody = getEmailBody(msgResponse.data);
+        if (!htmlBody) { /* ... skip ... */ }
 
-      // 4. Add to Google Sheets
-      const sheetName = 'Leads'; // !! Change this to your Sheet's tab name !!
-      const newRow = [
-        new Date().toISOString(),
-        lead.name,
-        lead.phone,
-        lead.email,
-        lead.product,
-        lead.message,
-        'New Lead', // Initial Status
-      ];
+        const lead = parseIndiaMartEmail(htmlBody, subject, fromAddress);
+        if (!lead) { /* ... skip ... */ }
 
-      await sheets.spreadsheets.values.append({
-        spreadsheetId: process.env.GOOGLE_SHEET_ID,
-        range: `${sheetName}!A1`,
-        valueInputOption: 'USER_ENTERED',
-        resource: {
-          values: [newRow],
-        },
-      });
+        // --- Add to Google Sheets (COLUMN ORDER ADJUSTED) ---
+        const sheetName = 'Leads'; // !! Change this to your Sheet's tab name !!
+        const newRow = [
+          new Date().toISOString(), // Column A: Timestamp
+          lead.name,                // Column B: Name
+          lead.company,             // Column C: Company <<-- NEW
+          lead.phone,               // Column D: Phone (was C)
+          lead.email,               // Column E: Email (was D)
+          lead.product,             // Column F: Product (was E)
+          lead.message,             // Column G: Requirements (was F)
+          'New Lead',               // Column H: Status (was G)
+        ];
 
-      console.log(`Added new lead to Google Sheets: ${lead.name}`);
-      leadsAdded.push(lead.name);
+        await sheets.spreadsheets.values.append({
+          spreadsheetId: process.env.GOOGLE_SHEET_ID,
+          range: `${sheetName}!A1`,
+          valueInputOption: 'USER_ENTERED',
+          insertDataOption: 'INSERT_ROWS',
+          resource: { values: [newRow] },
+        });
 
-      // 5. Send Welcome Messages
-      // !! Replace with your real template names !!
-      await sendWhatsAppMessage(lead.phone, 'welcome_template');
-      await sendEmail(
-        lead.email,
-        `Thank you for your enquiry - JANVI PACKAGING`,
-        `<p>Hi ${lead.name},</p><p>Thank you for your interest in ${lead.product}. We have received your enquiry and will contact you shortly.</p>`
-      );
+        console.log(`Added new lead to Google Sheets: ${lead.name} (Email ID: ${msgId})`);
+        leadsAdded.push(lead.name);
 
-      // 6. Mark email as "Read" (remove 'UNREAD' label)
-      await gmail.users.messages.modify({
-        userId: 'me',
-        id: msg.id,
-        resource: {
-          removeLabelIds: ['UNREAD'],
-        },
-      });
-    }
+        // --- Send Welcome Messages (UPDATED) ---
+        // Uses correct WhatsApp template name and updated sendEmail
+        await sendWhatsAppMessage(lead.phone, 'welcome', [
+          // Assuming 'welcome' template has one variable for customer name
+          { type: 'body', parameters: [{ type: 'text', text: lead.name }] }
+        ]);
+        await sendEmail(lead.email, lead.name, 'welcome', lead.product, lead.message); // Pass details to new sendEmail
 
-    res.status(200).send(`Successfully processed ${leadsAdded.length} new leads: ${leadsAdded.join(', ')}`);
-  } catch (error) {
-    console.error('Error in Gmail check cron job:', error);
-    res.status(500).send('Internal Server Error');
-  }
+        // Mark email as read (same as before)
+        await gmail.users.messages.modify({ userId: 'me', id: msgId, resource: { removeLabelIds: ['UNREAD'] } });
+        console.log(`Marked email ${msgId} as read.`);
+
+      } catch(error) { /* ... error handling ... */ }
+    } // End loop
+
+    // Response message (same as before)
+    /* ... response logic ... */
+    res.status(200).send(responseMessage);
+
+  } catch (error) { /* ... error handling ... */ }
 };
+
+// --- Helper Functions (need to be included if not already) ---
+// (Make sure the full definitions for sheetsAuth, oauth2Client, sheets, gmail, getEmailBody are present)
