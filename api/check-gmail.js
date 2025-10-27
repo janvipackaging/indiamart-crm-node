@@ -1,35 +1,39 @@
 // api/check-gmail.js
-require('dotenv').config({ path: '../../.env' }); // Load .env file for Vercel
+require('dotenv').config(); // Load .env for Render Cron Job context
 const { google } = require('googleapis');
 const cheerio = require('cheerio');
 const { sendWhatsAppMessage } = require('../utils/sendWhatsApp');
-const { sendEmail } = require('../utils/sendEmail'); // Use updated sender with HTML templates
+const { sendEmail } = require('../utils/sendEmail');
 
-// --- Google API Authentication ---
+// --- Google API Authentication Setup ---
+// These are defined globally but initialized inside the function
+let sheetsAuth, oauth2Client;
 
-// 1. Auth for Google Sheets (Service Account)
-const sheetsAuth = new google.auth.GoogleAuth({
-  credentials: {
-    client_email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
-    private_key: process.env.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY?.replace(/\\n/g, '\n'), // Added optional chaining for safety
-  },
-  scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-});
+try {
+    sheetsAuth = new google.auth.GoogleAuth({
+      credentials: {
+        client_email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
+        // Using replace directly here. Ensure PRIVATE_KEY is correctly set in Render Env Vars
+        private_key: process.env.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+      },
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    });
 
-// 2. Auth for Gmail (OAuth 2.0)
-const oauth2Client = new google.auth.OAuth2(
-  process.env.GOOGLE_CLIENT_ID,
-  process.env.GOOGLE_CLIENT_SECRET,
-  'https://developers.google.com/oauthplayground'
-);
+    oauth2Client = new google.auth.OAuth2(
+      process.env.GOOGLE_CLIENT_ID,
+      process.env.GOOGLE_CLIENT_SECRET,
+      'https://developers.google.com/oauthplayground' // Redirect URI is not used for refresh token flow
+    );
 
-oauth2Client.setCredentials({
-  refresh_token: process.env.GOOGLE_REFRESH_TOKEN,
-});
+    oauth2Client.setCredentials({
+      refresh_token: process.env.GOOGLE_REFRESH_TOKEN,
+    });
 
-// Initialize API clients globally
-const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
-const sheets = google.sheets({ version: 'v4', auth: sheetsAuth });
+} catch (authError) {
+    console.error("FATAL: Error initializing Google Auth clients:", authError.message);
+    // If auth setup fails, the script can't run. Exit gracefully.
+    process.exit(1); // Exit with a non-zero code to indicate failure
+}
 
 
 // --- Email Parsing Function (Handles Both Types & Company Name) ---
@@ -102,7 +106,7 @@ function parseIndiaMartEmail(htmlBody, subject, fromAddress) {
     if (lead.phone && !lead.phone.startsWith('91') && lead.phone.length >= 10) { lead.phone = `91${lead.phone.slice(-10)}`; }
     else if (lead.phone && lead.phone.length < 10) { console.warn(`Phone ${lead.phone} too short. Skipping.`); return null; }
 
-    // console.log("Parsed Lead:", JSON.stringify(lead)); // Optional: Keep for detailed production logs if needed
+    // console.log("Parsed Lead:", JSON.stringify(lead)); // Optional log
     return lead;
   } catch (error) { console.error(`CRITICAL Error parsing HTML (Subject: ${subject}):`, error); return null; }
 }
@@ -113,12 +117,120 @@ function getEmailBody(message) {
   let bodyData = '';
   const payload = message.payload;
   if (!payload) return null;
+  const findHtmlPart = (parts) => { /* ... same robust logic ... */ }; // Assume full function definition here
+  if (payload.mimeType === 'text/html' && payload.body?.data) { bodyData = payload.body.data; }
+  else if (payload.parts) { bodyData = findHtmlPart(payload.parts); }
+  else if (payload.body?.data) { bodyData = payload.body.data; }
+  if (!bodyData) { console.warn("getEmailBody: Could not extract body data."); return null; }
+  try { const cleanedData = bodyData.replace(/-/g, '+').replace(/_/g, '/'); return Buffer.from(cleanedData, 'base64').toString('utf-8'); }
+  catch(e){ console.error("getEmailBody: Error decoding base64:", e); return null; }
+}
 
-  // Function to find the HTML part recursively
+
+// --- Main Function (Wrapped for direct execution by Render Cron) ---
+async function runCronJob() {
+  // --- Initialize API clients inside ---
+  // Ensure auth objects were created successfully earlier
+  if (!sheetsAuth || !oauth2Client) {
+      console.error("Auth clients not initialized. Exiting.");
+      process.exitCode = 1;
+      return;
+  }
+  const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+  const sheets = google.sheets({ version: 'v4', auth: sheetsAuth });
+  // --- End Initializations ---
+
+  try {
+    console.log(`${new Date().toISOString()} Cron job started: Checking emails...`);
+
+    const listResponse = await gmail.users.messages.list({
+      userId: 'me',
+      q: 'is:unread {from:buyleads@indiamart.com from:buyershelpdesk@indiamart.com from:buyershelp+enq@indiamart.com} subject:film',
+      maxResults: 50, // Limit results per run to avoid timeouts, process remaining next time
+    });
+
+    const messages = listResponse.data.messages;
+    if (!messages || messages.length === 0) {
+      console.log('No new emails found matching criteria.');
+      return; // Exit cleanly
+    }
+
+    console.log(`Found ${messages.length} new email(s). Processing...`);
+    const leadsAdded = [];
+    const leadsFailed = [];
+
+    for (const msg of messages) {
+      let subject = ''; let fromAddress = ''; let msgId = msg.id;
+      try {
+        const msgResponse = await gmail.users.messages.get({ userId: 'me', id: msgId, format: 'full' });
+        if (!msgResponse.data?.payload?.headers) { console.warn(`No details for ${msgId}. Skipping.`); leadsFailed.push(msgId + " (Incomplete)"); continue; }
+
+        const headers = msgResponse.data.payload.headers;
+        subject = headers.find(h => h.name.toLowerCase() === 'subject')?.value || 'No Subject';
+        fromAddress = headers.find(h => h.name.toLowerCase() === 'from')?.value || 'Unknown Sender';
+        // console.log(`Processing Email ID: ${msgId}, Subject: ${subject}`);
+
+        const htmlBody = getEmailBody(msgResponse.data);
+        if (!htmlBody) {
+             console.warn(`No body for ${msgId}. Skipping.`); leadsFailed.push(msgId + " (No body)");
+             await gmail.users.messages.modify({ userId: 'me', id: msgId, resource: { removeLabelIds: ['UNREAD'] } }); // Mark as read to prevent retries
+             continue;
+        }
+
+        const lead = parseIndiaMartEmail(htmlBody, subject, fromAddress);
+        if (!lead) {
+          console.warn(`Could not parse ${msgId}. Skipping.`); leadsFailed.push(msgId + " (Parsing failed)");
+          await gmail.users.messages.modify({ userId: 'me', id: msgId, resource: { removeLabelIds: ['UNREAD'] } }); console.log(`Marked unparseable ${msgId} as read.`);
+          continue;
+        }
+
+        // Add to Google Sheets
+        const sheetName = 'Leads'; // !! Change this to your Sheet's tab name !!
+        const newRow = [ new Date().toISOString(), lead.name, lead.company, lead.phone, lead.email, lead.product, lead.message, 'New Lead' ];
+        await sheets.spreadsheets.values.append({
+          spreadsheetId: process.env.GOOGLE_SHEET_ID, range: `${sheetName}!A1`, valueInputOption: 'USER_ENTERED', insertDataOption: 'INSERT_ROWS', resource: { values: [newRow] },
+        });
+        console.log(`Added lead to Google Sheets: ${lead.name} (ID: ${msgId})`);
+        leadsAdded.push(lead.name);
+
+        // Send Welcome Messages
+        await sendWhatsAppMessage(lead.phone, 'welcome', [ { type: 'body', parameters: [{ type: 'text', text: lead.name, parameter_name: "customer_name" }] } ]); // Added parameter_name back
+        await sendEmail(lead.email, lead.name, 'welcome', lead.product, lead.message);
+
+        // Mark email as read
+        await gmail.users.messages.modify({ userId: 'me', id: msgId, resource: { removeLabelIds: ['UNREAD'] } });
+        console.log(`Marked processed email ${msgId} as read.`);
+
+      } catch(error) {
+           console.error(`Error processing ${msgId}:`, error.message);
+           leadsFailed.push(msgId + ` (Error)`);
+           // Don't mark as read on error to allow potential retry on next cron run
+      }
+    } // End loop
+
+    let responseMessage = `Successfully processed ${leadsAdded.length} leads: ${leadsAdded.join(', ')}.`;
+    if (leadsFailed.length > 0) { responseMessage += ` Failed ${leadsFailed.length} emails. IDs/Reasons: ${leadsFailed.join('; ')}`; }
+    console.log(`${new Date().toISOString()} Cron job finished. ${responseMessage}`);
+
+  } catch (error) {
+    console.error(`${new Date().toISOString()} CRITICAL Error in main cron function:`, error.message, error.stack);
+    process.exitCode = 1; // Signal failure to Render
+  }
+}
+
+// --- Run the job ---
+runCronJob();
+
+// Helper function definition for getEmailBody (ensure it's complete)
+function getEmailBody(message) {
+  let bodyData = '';
+  const payload = message.payload;
+  if (!payload) { console.warn("getEmailBody: No payload."); return null; }
+
   const findHtmlPart = (parts) => {
     if (!parts) return null;
     for (let part of parts) {
-      if (part.mimeType === 'text/html' && part.body && part.body.data) {
+      if (part.mimeType === 'text/html' && part.body?.data) {
         return part.body.data;
       }
       if (part.parts) {
@@ -129,136 +241,15 @@ function getEmailBody(message) {
     return null;
   };
 
-  // --- Extraction Logic ---
   if (payload.mimeType === 'text/html' && payload.body?.data) {
     bodyData = payload.body.data;
   } else if (payload.parts) {
     bodyData = findHtmlPart(payload.parts);
-  } else if (payload.body?.data) { // Fallback
+  } else if (payload.body?.data) {
        bodyData = payload.body.data;
   }
 
-  if (!bodyData) {
-       console.warn("getEmailBody: Could not extract body data.");
-      return null;
-  }
-
-  // Decode Base64
-  try {
-      const cleanedData = bodyData.replace(/-/g, '+').replace(/_/g, '/');
-      return Buffer.from(cleanedData, 'base64').toString('utf-8');
-  } catch(e){
-      console.error("getEmailBody: Error decoding base64:", e);
-      return null;
-  }
+  if (!bodyData) { console.warn("getEmailBody: Could not extract body data."); return null; }
+  try { const cleanedData = bodyData.replace(/-/g, '+').replace(/_/g, '/'); return Buffer.from(cleanedData, 'base64').toString('utf-8'); }
+  catch(e){ console.error("getEmailBody: Error decoding base64:", e); return null; }
 }
-
-
-// --- Main Serverless Function (Restored for Vercel) ---
-module.exports = async (req, res) => {
-  try {
-    console.log('Cron job started: Checking for new emails...');
-
-    const listResponse = await gmail.users.messages.list({
-      userId: 'me',
-      q: 'is:unread {from:buyleads@indiamart.com from:buyershelpdesk@indiamart.com from:buyershelp+enq@indiamart.com} subject:film',
-    });
-
-    const messages = listResponse.data.messages;
-    if (!messages || messages.length === 0) {
-      console.log('No new emails found matching the criteria.');
-      return res.status(200).send('No new emails found.'); // Send response for Vercel
-    }
-
-    console.log(`Found ${messages.length} new email(s). Processing...`);
-    const leadsAdded = [];
-    const leadsFailed = [];
-
-    // Process ALL found messages
-    for (const msg of messages) {
-      let subject = ''; let fromAddress = ''; let msgId = msg.id;
-      try {
-        const msgResponse = await gmail.users.messages.get({
-            userId: 'me',
-            id: msgId,
-            format: 'full' // Request full details
-        });
-
-        if (!msgResponse.data?.payload?.headers) {
-             console.warn(`Could not get sufficient details for email ID: ${msgId}. Skipping.`);
-             leadsFailed.push(msgId + " (Incomplete)");
-             continue;
-         }
-
-        const headers = msgResponse.data.payload.headers;
-        subject = headers.find(h => h.name.toLowerCase() === 'subject')?.value || 'No Subject';
-        fromAddress = headers.find(h => h.name.toLowerCase() === 'from')?.value || 'Unknown Sender';
-        // console.log(`Processing Email ID: ${msgId}, Subject: ${subject}`); // Optional log
-
-        const htmlBody = getEmailBody(msgResponse.data);
-        if (!htmlBody) {
-             console.warn(`Could not extract/decode body for email ID: ${msgId}. Skipping.`);
-             leadsFailed.push(msgId + " (No body)");
-             // Mark as read to avoid retrying emails with bad bodies
-             await gmail.users.messages.modify({ userId: 'me', id: msgId, resource: { removeLabelIds: ['UNREAD'] } });
-             continue;
-        }
-
-        const lead = parseIndiaMartEmail(htmlBody, subject, fromAddress);
-        if (!lead) {
-          console.warn(`Could not parse details from email ID: ${msgId}. Skipping.`);
-          leadsFailed.push(msgId + " (Parsing failed)");
-          // Mark as read to avoid retrying unparseable emails
-          await gmail.users.messages.modify({ userId: 'me', id: msgId, resource: { removeLabelIds: ['UNREAD'] } });
-          console.log(`Marked unparseable email ${msgId} as read.`);
-          continue; // Skip further processing if parsing failed
-        }
-
-        // --- UNCOMMENTED Actions ---
-        // Add to Google Sheets
-        const sheetName = 'Leads'; // !! Change this to your Sheet's tab name !!
-        const newRow = [
-          new Date().toISOString(), // A: Timestamp
-          lead.name,                // B: Name
-          lead.company,             // C: Company
-          lead.phone,               // D: Phone
-          lead.email,               // E: Email
-          lead.product,             // F: Product
-          lead.message,             // G: Requirements
-          'New Lead',               // H: Status
-        ];
-        await sheets.spreadsheets.values.append({
-          spreadsheetId: process.env.GOOGLE_SHEET_ID, range: `${sheetName}!A1`, valueInputOption: 'USER_ENTERED', insertDataOption: 'INSERT_ROWS', resource: { values: [newRow] },
-        });
-        console.log(`Added lead to Google Sheets: ${lead.name} (ID: ${msgId})`);
-        leadsAdded.push(lead.name);
-
-        // Send Welcome Messages
-        await sendWhatsAppMessage(lead.phone, 'welcome', [ { type: 'body', parameters: [{ type: 'text', text: lead.name }] } ]);
-        await sendEmail(lead.email, lead.name, 'welcome', lead.product, lead.message);
-
-        // Mark email as read
-        await gmail.users.messages.modify({ userId: 'me', id: msgId, resource: { removeLabelIds: ['UNREAD'] } });
-        console.log(`Marked processed email ${msgId} as read.`);
-        // --- End UNCOMMENTED Actions ---
-
-      } catch(error) {
-           console.error(`Error processing email ID: ${msgId} (Subject: ${subject}):`, error.message);
-           leadsFailed.push(msgId + ` (Error: ${error.message.substring(0, 50)}...)`);
-           // Consider not marking as read on error to allow retry, especially for API errors
-      }
-    } // End loop
-
-    let responseMessage = `Successfully processed ${leadsAdded.length} leads: ${leadsAdded.join(', ')}.`;
-    if (leadsFailed.length > 0) {
-        responseMessage += ` Failed ${leadsFailed.length} emails. IDs/Reasons: ${leadsFailed.join('; ')}`;
-    }
-    console.log("Cron job finished.", responseMessage);
-    res.status(200).send(responseMessage); // Restore response for Vercel
-
-  } catch (error) {
-    console.error('CRITICAL Error in main cron function:', error.message, error.stack);
-    res.status(500).send(`Internal Server Error: ${error.message}`); // Restore response for Vercel
-  }
-} // Removed closing brace for runLocalTest
-// Removed runLocalTest() call
